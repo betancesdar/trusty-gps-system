@@ -1,0 +1,156 @@
+# ═══════════════════════════════════════════════════════════════════
+# Trusty GPS System — Production Docker Compose
+# Deploy: docker compose -f docker-compose.prod.yml up -d
+# Requires: .env.prod (copy from .env.prod.example and fill values)
+# ═══════════════════════════════════════════════════════════════════
+
+services:
+
+  # ─────────────────────────────────────────────────────────────────
+  # PostgreSQL (internal only — no external port exposure)
+  # ─────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: trusty-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    # NO ports: — not exposed to host, only internal network
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - trusty-internal
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────────────────────────────
+  # Redis (internal only — no external port exposure)
+  # ─────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: trusty-redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    # NO ports: — not exposed to host, only internal network
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    networks:
+      - trusty-internal
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────────────────────────────
+  # Backend API
+  # ─────────────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./app-gps-manager-backend
+      dockerfile: Dockerfile
+    container_name: trusty-backend
+    # No external port — nginx handles routing
+    environment:
+      - NODE_ENV=production
+      - PORT=4000
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      - REDIS_URL=redis://redis:6379
+      - JWT_SECRET=${JWT_SECRET}
+      - DEFAULT_ADMIN_PASSWORD=${DEFAULT_ADMIN_PASSWORD}
+      - ORS_API_KEY=${ORS_API_KEY}
+      - ORS_API_URL=${ORS_API_URL:-https://api.openrouteservice.org}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-https://admin.trustygps.app}
+      - STREAM_TICK_MS=${STREAM_TICK_MS:-1000}
+      - ENROLL_TTL_SECONDS=${ENROLL_TTL_SECONDS:-600}
+    # Use migrate deploy (not db push) in production
+    # Note: If first deploy without migration files, change to: npx prisma db push && node src/server.js
+    command: sh -c "npx prisma migrate deploy && node src/server.js"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:4000/health || exit 1" ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - trusty-internal
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────────────────────────────
+  # Frontend (Next.js — standalone)
+  # NEXT_PUBLIC_* vars are baked at BUILD time, so must be build args
+  # ─────────────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./gps-platform-frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-https://api.trustygps.app}
+        NEXT_PUBLIC_MAP_CENTER_LAT: ${NEXT_PUBLIC_MAP_CENTER_LAT:-40.4168}
+        NEXT_PUBLIC_MAP_CENTER_LNG: ${NEXT_PUBLIC_MAP_CENTER_LNG:--3.7038}
+        NEXT_PUBLIC_MAP_ZOOM: ${NEXT_PUBLIC_MAP_ZOOM:-13}
+    container_name: trusty-frontend
+    environment:
+      NODE_ENV: production
+      PORT: 8547
+      HOSTNAME: "0.0.0.0"
+    # No external port — nginx handles routing
+    healthcheck:
+      test: [ "CMD", "wget", "-qO-", "http://localhost:8547/" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - trusty-internal
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────────────────────────────
+  # Nginx Reverse Proxy
+  # ─────────────────────────────────────────────────────────────────
+  nginx:
+    image: nginx:alpine
+    container_name: trusty-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+      - /var/www/certbot:/var/www/certbot:ro
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+    networks:
+      - trusty-internal
+    restart: unless-stopped
+
+# ═══════════════════════════════════════════════════════════════════
+# Volumes (persistent)
+# ═══════════════════════════════════════════════════════════════════
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+# ═══════════════════════════════════════════════════════════════════
+# Networks
+# ═══════════════════════════════════════════════════════════════════
+networks:
+  trusty-internal:
+    driver: bridge
