@@ -1,6 +1,8 @@
 [submodule "app-gps-manager-backend"]
 	path = app-gps-manager-backend
 	url = https://github.com/betancesdar/app-gps-manager-backend.git
+	branch = main
 [submodule "gps-platform-frontend"]
 	path = gps-platform-frontend
 	url = https://github.com/betancesdar/gps-platform-frontend.git
+	branch = main
